@@ -51,6 +51,11 @@ bool format(OutputRange)(string source_desc, ubyte[] buffer, OutputRange output,
     auto tokens = app.data;
     if (!tokenRange.messages.empty)
         return false;
+
+    import dfmt.editorconfig : OptionalBoolean;
+    if (formatterConfig.dfmt_force_curly_braces == OptionalBoolean.t)
+        tokens = insertForcedBraces(tokens);
+
     auto depths = generateDepthInfo(tokens);
     auto tokenFormatter = TokenFormatter!OutputRange(buffer, tokens, depths,
             output, &astInformation, formatterConfig);
@@ -2367,6 +2372,527 @@ const pure @safe @nogc:
         return t == tok!"," || t == tok!";" || t == tok!":" || t == tok!"("
             || t == tok!")" || t == tok!"[" || t == tok!"]" || t == tok!"{" || t == tok!"}";
     }
+}
+
+/**
+ * Insert `{` and `}` tokens around single-statement bodies for block headers
+ * (if, else, for, foreach, while, do, etc.) when force_curly_braces is enabled.
+ *
+ * This preprocessing step runs on the token array before the formatter, so the
+ * formatter's existing brace-handling logic takes care of style and indentation.
+ */
+Token[] insertForcedBraces(const(Token)[] tokens)
+{
+    import std.array : appender, Appender;
+
+    // Collect insertion points: (index, true=open/false=close)
+    // We'll insert `{` before the token at `index`, or `}` after the token at `index-1`.
+    struct Insertion
+    {
+        size_t position;  // insert BEFORE this token index
+        bool isOpen;      // true = `{`, false = `}`
+    }
+
+    Appender!(Insertion[]) insertions;
+
+    // Helper: is this token type a block header keyword that takes parens?
+    static bool isParenBlockHeader(IdType t) pure nothrow @safe @nogc
+    {
+        return t == tok!"if" || t == tok!"for" || t == tok!"foreach"
+            || t == tok!"foreach_reverse" || t == tok!"while"
+            || t == tok!"catch" || t == tok!"with"
+            || t == tok!"synchronized" || t == tok!"scope"
+            || t == tok!"version";
+    }
+
+    // Skip past comments at position i, return new position
+    size_t skipComments(size_t i) nothrow @safe @nogc
+    {
+        while (i < tokens.length && tokens[i].type == tok!"comment")
+            i++;
+        return i;
+    }
+
+    // Skip past matched parentheses starting at open paren at position i.
+    // Returns position AFTER the closing paren, or tokens.length on error.
+    size_t skipParens(size_t i) nothrow @safe @nogc
+    {
+        if (i >= tokens.length || tokens[i].type != tok!"(")
+            return i;
+        int depth = 1;
+        i++;
+        while (i < tokens.length && depth > 0)
+        {
+            if (tokens[i].type == tok!"(")
+                depth++;
+            else if (tokens[i].type == tok!")")
+                depth--;
+            i++;
+        }
+        return i;
+    }
+
+    // Find the end of a single statement starting at position `i`.
+    // Returns the position AFTER the statement (i.e., after the `;` or closing `}`).
+    // For block headers, this recurses to find the full construct including else.
+    size_t findStatementEnd(size_t i)
+    {
+        i = skipComments(i);
+        if (i >= tokens.length)
+            return i;
+
+        auto t = tokens[i].type;
+
+        // If the statement starts with '{', find matching '}'
+        if (t == tok!"{")
+        {
+            int depth = 1;
+            i++;
+            while (i < tokens.length && depth > 0)
+            {
+                if (tokens[i].type == tok!"{")
+                    depth++;
+                else if (tokens[i].type == tok!"}")
+                    depth--;
+                i++;
+            }
+            return i;
+        }
+
+        // If the statement is a block header with parens (if, for, while, etc.)
+        if (isParenBlockHeader(t))
+        {
+            i++; // skip keyword
+            i = skipComments(i);
+            if (i < tokens.length && tokens[i].type == tok!"(")
+                i = skipParens(i);
+            i = skipComments(i);
+            // Now find the body
+            size_t bodyEnd = findStatementEnd(i);
+
+            // Special case for `if`: check for trailing `else`
+            if (t == tok!"if")
+            {
+                size_t afterBody = skipComments(bodyEnd);
+                if (afterBody < tokens.length && tokens[afterBody].type == tok!"else")
+                {
+                    afterBody++; // skip `else`
+                    afterBody = skipComments(afterBody);
+                    bodyEnd = findStatementEnd(afterBody);
+                }
+            }
+            return bodyEnd;
+        }
+
+        // `debug` can appear with or without parens
+        if (t == tok!"debug")
+        {
+            i++; // skip `debug`
+            i = skipComments(i);
+            if (i < tokens.length && tokens[i].type == tok!"(")
+                i = skipParens(i);
+            i = skipComments(i);
+            size_t bodyEnd = findStatementEnd(i);
+            // Check for trailing else
+            size_t afterBody = skipComments(bodyEnd);
+            if (afterBody < tokens.length && tokens[afterBody].type == tok!"else")
+            {
+                afterBody++;
+                afterBody = skipComments(afterBody);
+                bodyEnd = findStatementEnd(afterBody);
+            }
+            return bodyEnd;
+        }
+
+        // `do` ... `while` construct
+        if (t == tok!"do")
+        {
+            i++; // skip `do`
+            i = skipComments(i);
+            size_t bodyEnd = findStatementEnd(i);
+            bodyEnd = skipComments(bodyEnd);
+            // Expect `while`
+            if (bodyEnd < tokens.length && tokens[bodyEnd].type == tok!"while")
+            {
+                bodyEnd++; // skip `while`
+                bodyEnd = skipComments(bodyEnd);
+                if (bodyEnd < tokens.length && tokens[bodyEnd].type == tok!"(")
+                    bodyEnd = skipParens(bodyEnd);
+                // skip trailing `;`
+                bodyEnd = skipComments(bodyEnd);
+                if (bodyEnd < tokens.length && tokens[bodyEnd].type == tok!";")
+                    bodyEnd++;
+            }
+            return bodyEnd;
+        }
+
+        // `try` ... `catch` ... `finally` compound
+        if (t == tok!"try")
+        {
+            i++; // skip `try`
+            i = skipComments(i);
+            size_t bodyEnd = findStatementEnd(i); // try body
+            // Check for catch/finally chains
+            while (true)
+            {
+                size_t next = skipComments(bodyEnd);
+                if (next < tokens.length && tokens[next].type == tok!"catch")
+                {
+                    next++; // skip catch
+                    next = skipComments(next);
+                    if (next < tokens.length && tokens[next].type == tok!"(")
+                        next = skipParens(next);
+                    next = skipComments(next);
+                    bodyEnd = findStatementEnd(next); // catch body
+                }
+                else if (next < tokens.length && tokens[next].type == tok!"finally")
+                {
+                    next++; // skip finally
+                    next = skipComments(next);
+                    bodyEnd = findStatementEnd(next); // finally body
+                    break; // finally is always last
+                }
+                else
+                    break;
+            }
+            return bodyEnd;
+        }
+
+        // `finally` — just a body, no parens
+        if (t == tok!"finally")
+        {
+            i++; // skip `finally`
+            i = skipComments(i);
+            return findStatementEnd(i);
+        }
+
+        // `else` (standalone, not `else if`)
+        if (t == tok!"else")
+        {
+            i++; // skip `else`
+            i = skipComments(i);
+            return findStatementEnd(i);
+        }
+
+        // Regular statement: scan to `;` at depth 0
+        int depth = 0;
+        while (i < tokens.length)
+        {
+            if (tokens[i].type == tok!"(" || tokens[i].type == tok!"["
+                    || tokens[i].type == tok!"{")
+                depth++;
+            else if (tokens[i].type == tok!")" || tokens[i].type == tok!"]"
+                    || tokens[i].type == tok!"}")
+            {
+                depth--;
+                if (depth < 0)
+                    break; // unmatched close - stop
+            }
+            else if (tokens[i].type == tok!";" && depth == 0)
+            {
+                i++; // include the semicolon
+                return i;
+            }
+            i++;
+        }
+        return i;
+    }
+
+    // Find the end of just the "then" part of an if statement (not including else).
+    // This is needed because findStatementEnd for if includes the else.
+    size_t findThenBodyEnd(size_t i)
+    {
+        i = skipComments(i);
+        if (i >= tokens.length)
+            return i;
+
+        auto t = tokens[i].type;
+
+        // Braced body
+        if (t == tok!"{")
+        {
+            int depth = 1;
+            i++;
+            while (i < tokens.length && depth > 0)
+            {
+                if (tokens[i].type == tok!"{")
+                    depth++;
+                else if (tokens[i].type == tok!"}")
+                    depth--;
+                i++;
+            }
+            return i;
+        }
+
+        // If the then-body is itself a block header, we need the full construct
+        // but NOT its else (since that else belongs to the outer if)
+        // Actually, for nested if: `if (a) if (b) x; else y; else z;`
+        // the first else belongs to the inner if. We need to include it.
+        // So we use findStatementEnd which handles if+else as a unit.
+        if (isParenBlockHeader(t) || t == tok!"debug" || t == tok!"do" || t == tok!"else"
+                || t == tok!"try" || t == tok!"finally")
+        {
+            return findStatementEnd(i);
+        }
+
+        // Regular statement
+        int depth = 0;
+        while (i < tokens.length)
+        {
+            if (tokens[i].type == tok!"(" || tokens[i].type == tok!"["
+                    || tokens[i].type == tok!"{")
+                depth++;
+            else if (tokens[i].type == tok!")" || tokens[i].type == tok!"]"
+                    || tokens[i].type == tok!"}")
+            {
+                depth--;
+                if (depth < 0)
+                    break;
+            }
+            else if (tokens[i].type == tok!";" && depth == 0)
+            {
+                i++;
+                return i;
+            }
+            i++;
+        }
+        return i;
+    }
+
+    // Process a block header body at position `i` (after the condition/parens).
+    // If the body is not braced, record insertion points for `{` and `}`.
+    // Only wraps the immediate body, not any trailing `else` — the main loop
+    // handles `else` and inner block headers separately.
+    void processBody(size_t i, IdType headerType)
+    {
+        size_t bodyStart = skipComments(i);
+        if (bodyStart >= tokens.length)
+            return;
+
+        // Already braced or empty statement - no insertion needed
+        if (tokens[bodyStart].type == tok!"{" || tokens[bodyStart].type == tok!";")
+            return;
+
+        // For certain keywords after function declarations, don't insert braces
+        if (tokens[bodyStart].type == tok!"in" || tokens[bodyStart].type == tok!"out"
+                || tokens[bodyStart].type == tok!"do")
+            return;
+        if (bodyStart < tokens.length && tokens[bodyStart].text == "body")
+            return;
+
+        // For `if`/`debug`/`version` with `else`: wrap only the "then" body.
+        // The main loop will handle `else` when it encounters it.
+        if (headerType == tok!"if" || headerType == tok!"debug"
+                || headerType == tok!"version")
+        {
+            size_t thenEnd = findThenBodyEnd(bodyStart);
+            insertions ~= Insertion(bodyStart, true);
+            insertions ~= Insertion(thenEnd, false);
+            return;
+        }
+
+        // For non-if block headers (for, foreach, while, etc.)
+        size_t stmtEnd = findStatementEnd(bodyStart);
+        insertions ~= Insertion(bodyStart, true);
+        insertions ~= Insertion(stmtEnd, false);
+    }
+
+    // Helper: extract the meaningful text from a comment token (strip // or /* */)
+    static string getDfmtCommentText(string commentText) pure @safe
+    {
+        import std.string : strip;
+
+        if (commentText.length >= 2 && commentText[0 .. 2] == "//")
+            return commentText[2 .. $].strip();
+        else if (commentText.length > 3)
+            return commentText[2 .. $ - 2].strip();
+        else if (commentText.length >= 2)
+            return commentText[2 .. $].strip();
+        return commentText;
+    }
+
+    // Main scan: walk through tokens and look for block headers.
+    // We process every token position; processBody only records insertions,
+    // it does NOT cause the main loop to skip tokens, so inner block headers
+    // (like nested if, foreach inside if body, etc.) are also processed.
+    size_t i = 0;
+    bool dfmtOff = false;
+    while (i < tokens.length)
+    {
+        auto t = tokens[i].type;
+
+        // Track `// dfmt off` / `// dfmt on` comment regions.
+        // When dfmtOff is true, skip all block header processing.
+        if (t == tok!"comment")
+        {
+            auto ct = getDfmtCommentText(tokens[i].text);
+            if (ct == "dfmt off")
+                dfmtOff = true;
+            else if (ct == "dfmt on")
+                dfmtOff = false;
+            i++;
+            continue;
+        }
+
+        if (dfmtOff)
+        {
+            i++;
+            continue;
+        }
+
+        // Block header with parens
+        if (isParenBlockHeader(t))
+        {
+            size_t afterKw = i + 1;
+            afterKw = skipComments(afterKw);
+            if (afterKw < tokens.length && tokens[afterKw].type == tok!"(")
+            {
+                size_t afterParens = skipParens(afterKw);
+                processBody(afterParens, t);
+            }
+            else if (t == tok!"synchronized")
+            {
+                // synchronized without parens: `synchronized stmt;`
+                processBody(afterKw, t);
+            }
+            i++;
+            continue;
+        }
+
+        // `debug` keyword — can appear with or without parens
+        if (t == tok!"debug")
+        {
+            size_t afterKw = i + 1;
+            afterKw = skipComments(afterKw);
+            if (afterKw < tokens.length && tokens[afterKw].type == tok!"(")
+            {
+                size_t afterParens = skipParens(afterKw);
+                processBody(afterParens, t);
+            }
+            else
+            {
+                // debug without parens: `debug stmt;`
+                processBody(afterKw, t);
+            }
+            i++;
+            continue;
+        }
+
+        // `do` keyword (not `do` in function body contracts)
+        if (t == tok!"do")
+        {
+            size_t bodyStart = skipComments(i + 1);
+            if (bodyStart < tokens.length && tokens[bodyStart].type != tok!"{"
+                    && tokens[bodyStart].type != tok!";")
+            {
+                // Find end of do body (just the single statement, not the while)
+                size_t stmtEnd = findThenBodyEnd(bodyStart);
+                insertions ~= Insertion(bodyStart, true);
+                insertions ~= Insertion(stmtEnd, false);
+            }
+            i++;
+            continue;
+        }
+
+        // `finally` keyword — never takes parens
+        if (t == tok!"finally")
+        {
+            size_t bodyStart = skipComments(i + 1);
+            if (bodyStart < tokens.length && tokens[bodyStart].type != tok!"{"
+                    && tokens[bodyStart].type != tok!";")
+            {
+                size_t stmtEnd = findStatementEnd(bodyStart);
+                insertions ~= Insertion(bodyStart, true);
+                insertions ~= Insertion(stmtEnd, false);
+            }
+            i++;
+            continue;
+        }
+
+        // `else` keyword
+        if (t == tok!"else")
+        {
+            size_t afterElse = skipComments(i + 1);
+            if (afterElse < tokens.length)
+            {
+                auto nextT = tokens[afterElse].type;
+                // else if / else version / else static if — skip, let inner handle it
+                if (nextT == tok!"if" || nextT == tok!"version"
+                        || (nextT == tok!"static" && afterElse + 1 < tokens.length
+                            && (tokens[afterElse + 1].type == tok!"if"
+                                || tokens[afterElse + 1].type == tok!"foreach"
+                                || tokens[afterElse + 1].type == tok!"foreach_reverse")))
+                {
+                    i++;
+                    continue;
+                }
+                // else with braced body - skip
+                if (nextT == tok!"{")
+                {
+                    i++;
+                    continue;
+                }
+                // else with braceless body - add braces
+                size_t elseBodyEnd = findStatementEnd(afterElse);
+                insertions ~= Insertion(afterElse, true);
+                insertions ~= Insertion(elseBodyEnd, false);
+            }
+            i++;
+            continue;
+        }
+
+        i++;
+    }
+
+    // If no insertions needed, return the original array
+    if (insertions.data.length == 0)
+        return cast(Token[]) tokens;
+
+    // Sort insertions by position (stable sort: opens before closes at same position)
+    import std.algorithm : sort;
+    auto ins = insertions.data;
+    sort!((a, b) {
+        if (a.position != b.position)
+            return a.position < b.position;
+        // At the same position, open brace comes before close brace
+        // (shouldn't normally happen, but handle gracefully)
+        return a.isOpen && !b.isOpen;
+    })(ins);
+
+    // Build the new token array
+    auto result = appender!(Token[])();
+    result.reserve(tokens.length + ins.length);
+
+    size_t insIdx = 0;
+    for (size_t ti = 0; ti <= tokens.length; ti++)
+    {
+        // Insert any synthetic tokens at this position
+        while (insIdx < ins.length && ins[insIdx].position == ti)
+        {
+            Token synth;
+            synth.type = ins[insIdx].isOpen ? tok!"{" : tok!"}";
+            // Use size_t.max minus a counter for unique synthetic indices
+            // that won't match any AST info lookups
+            synth.index = size_t.max - insIdx;
+            // Copy line/column from the nearest real token for reasonable error messages
+            if (ti < tokens.length)
+            {
+                synth.line = tokens[ti].line;
+                synth.column = tokens[ti].column;
+            }
+            else if (tokens.length > 0)
+            {
+                synth.line = tokens[$ - 1].line;
+                synth.column = tokens[$ - 1].column;
+            }
+            result ~= synth;
+            insIdx++;
+        }
+        if (ti < tokens.length)
+            result ~= tokens[ti];
+    }
+
+    return result.data;
 }
 
 bool canFindIndex(const size_t[] items, size_t index, size_t* pos = null) pure @safe @nogc
