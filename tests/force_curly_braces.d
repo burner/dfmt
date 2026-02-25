@@ -103,6 +103,9 @@ void test14() {
     scope(exit)
         cleanup();
     doWork();
+
+    scope int[] array = new int[](127);
+	scope T!() x = 5;
 }
 
 // 15. synchronized without braces
