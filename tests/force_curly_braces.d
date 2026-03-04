@@ -187,3 +187,16 @@ void test24() {
         debug
             doDebugPosix();
 }
+
+// 25. version + unittest
+void test25() {
+	string command;
+	version (Posix) command ~= " 2> /dev/null 1> /dev/null";
+
+	version (Posix) command ~= " 2> /dev/null 1> /dev/null";
+
+	unittest
+	{
+		version (Posix) command ~= " 2> /dev/null 1> /dev/null";
+	}
+}
