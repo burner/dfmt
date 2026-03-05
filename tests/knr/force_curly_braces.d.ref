@@ -246,12 +246,22 @@ void test25()
     version (Posix) {
         command ~= " 2> /dev/null 1> /dev/null";
     }
+
     version (Posix) {
         command ~= " 2> /dev/null 1> /dev/null";
     }
+
     unittest {
         version (Posix) {
             command ~= " 2> /dev/null 1> /dev/null";
         }
+    }
+}
+
+// 26. Trailing comments on if statement
+unittest {
+    if (imin.value > 0x10FFFFUL) // One
+    {
+        imin.value = 0x10FFFFUL; // Two
     }
 }
