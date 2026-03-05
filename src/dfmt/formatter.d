@@ -383,7 +383,7 @@ private:
                     || isNumberLiteral(tokens[index].type)
                     || (inAsm  && peekBack2Is(tok!";") && currentIs(tok!"["))
             )))
-                      //dfmt on
+                          //dfmt on
             {
                 write(" ");
             }
@@ -939,8 +939,7 @@ private:
             writeToken();
             indents.popWrapIndents();
             linebreakHints = [];
-            while (indents.topIsOneOf(tok!"enum", tok!"try", tok!"catch",
-                    tok!"finally", tok!"debug"))
+            while (indents.topIsOneOf(tok!"enum", tok!"try", tok!"catch", tok!"finally"))
                 indents.pop();
             if (indents.topAre(tok!"static", tok!"else"))
             {
@@ -1264,7 +1263,7 @@ private:
             //indents.dump();
             while (indents.topIsOneOf(tok!"foreach", tok!"for", tok!"while"))
                 indents.pop();
-            if (indents.topIsOneOf(tok!"if", tok!"version"))
+            if (indents.topIsOneOf(tok!"if", tok!"version", tok!"debug"))
                 indents.pop();
             indents.push(tok!"else");
             newline();
@@ -1793,9 +1792,11 @@ private:
                 && astInformation.namedArgumentColonLocations.canFindIndex(tokens[index + 1].index);
             if (currentIs(tok!"else"))
             {
+                // Align 'else' with the corresponding conditional construct (if/version/debug)
                 immutable i = indents.indentToMostRecent(tok!"if");
                 immutable v = indents.indentToMostRecent(tok!"version");
-                immutable mostRecent = max(i, v);
+                immutable d = indents.indentToMostRecent(tok!"debug");
+                immutable mostRecent = max(i, v, d);
                 if (mostRecent != -1)
                     indentLevel = mostRecent;
             }
@@ -1873,7 +1874,7 @@ private:
                 else
                     while (sBraceDepth == 0 && indents.topIsTemp()
                             && ((!indents.topIsOneOf(tok!"else", tok!"if",
-                                tok!"static", tok!"version")) || !peekIs(tok!"else")))
+                                tok!"static", tok!"version", tok!"debug")) || !peekIs(tok!"else")))
                     {
                         indents.pop();
                     }
