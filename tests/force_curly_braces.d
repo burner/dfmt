@@ -244,3 +244,15 @@ unittest
     if (imin.value > 0x10FFFFUL) // One
         imin.value = 0x10FFFFUL; // Two
 }
+
+// 27. Complex version/else/debug/else chain
+unittest
+{
+    version (Windows)
+        __locale_decpoint = save;
+    else version (Foo)
+        __locale_decpoint = save;
+    else
+        debug __x = 3;
+        else foobar();
+}
